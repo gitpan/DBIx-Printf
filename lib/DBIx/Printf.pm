@@ -6,37 +6,82 @@ use DBI;
 package main;
 
 sub DBI::db::printf {
-    my ($self, $base, @params) = @_;
+    my ($dbh, $fmt, @params) = @_;
     
-    $base =~ s/%([dfs\%])/
-        $1 eq '%' ? '%' :
-            @params
-                ? DBIx::Printf::_printf_quote($self, $1, shift @params)
-                    : die "too few parameters\n"
-                        /eg;
+    my $sql = DBIx::Printf::_printf($dbh, $fmt, \@params);
     die "too many parameters\n" if @params;
-    $base;
+    $sql;
 }
 
 package DBIx::Printf;
 
+our $VERSION = 0.05;
+
+sub _printf {
+    my ($dbh, $fmt, $params, $in_like) = @_;
+    
+    $fmt =~ s/\%(?:([dfst\%])|like\((.*?)\))/
+        _printf_quote({
+            dbh      => $dbh,
+            params   => $params,
+            type     => $1 || 'like',
+            like_fmt => $2,
+            in_like  => $in_like,
+        })
+            /eg;
+    $fmt;
+}
+
 sub _printf_quote {
-    my ($dbh, $type, $param) = @_;
+    my $in = shift;
+    my $out;
+    
+    if ($in->{type} eq '%') {
+        return '%';
+    } elsif ($in->{type} eq 'like') {
+        return "'"
+            . _printf($in->{dbh}, $in->{like_fmt}, $in->{params}, 1)
+                . "'";
+    }
+    
+    return _printf_quote_simple(
+        $in->{dbh}, $in->{type}, $in->{params}, $in->{in_like}
+    );
+}
+
+sub _printf_quote_simple {
     no warnings;
+    my ($dbh, $type, $params, $in_like) = @_;
+    
+    die "too few parameters\n" unless @$params;
+    my $param = shift @$params;
     
     if ($type eq 'd') {
         $param = int($param);
     } elsif ($type eq 'f') {
         $param = $param + 0;
+    } elsif ($type eq 'l') {
+        $param = s/[\%_]/\\$1/g;
+        $param = $dbh->quote($param); # be paranoiac, use DBI::db::quote
+        $param =~ s/^'(.*)'$/$1/s
+            or die "unexpected quote char used: $param\n";
     } elsif ($type eq 's') {
+        if ($in_like) {
+            $param =~ s/[%_]/\\$&/g;
+        }
         $param = $dbh->quote($param);
+        if ($in_like) {
+            $param =~ s/^'(.*)'$/$1/s
+                or die "unexpected quote char: $param\n";
+        }
+    } elsif ($type eq 't') {
+        # pass thru
     } else {
-        die "unknown type: $type\n";
+        die "unexpected type: $type\n";
     }
+    
     $param;
 }
-
-our $VERSION = 0.04;
 
 1;
 
@@ -66,9 +111,18 @@ C<DBIx::Printf> is a printf-style prepared statement.  It adds a C<printf> metho
 
 Builds a SQL statement from given statement with placeholders and values.  Following placeholders are supported.
 
-  %s - string
-  %d - integer
-  %f - floating point
+  %d         - integer
+  %f         - floating point
+  %s         - string
+  %t         - do not quote, pass thru
+  %like(fmt) - formats and quotes a string for like expression
+
+=head3 %like example
+
+Below is an example of using the %%like placeholder.  Since metacharacters of supplied parameters are escaped, the example would always by a prefix search.
+
+  $dbh->printf('select * from t where name like %like(%s%%)', $name);
+
 
 =head1 AUTHOR
 
