@@ -2,20 +2,11 @@ use strict;
 use warnings;
 
 use DBI;
-
-package main;
-
-sub DBI::db::printf {
-    my ($dbh, $fmt, @params) = @_;
-    
-    my $sql = DBIx::Printf::_printf($dbh, $fmt, \@params);
-    die "too many parameters\n" if @params;
-    $sql;
-}
+use Carp::Clan;
 
 package DBIx::Printf;
 
-our $VERSION = 0.06;
+our $VERSION = '0.07';
 
 sub _printf {
     my ($dbh, $fmt, $params, $in_like) = @_;
@@ -53,7 +44,7 @@ sub _printf_quote_simple {
     no warnings;
     my ($dbh, $type, $params, $in_like) = @_;
     
-    die "too few parameters\n" unless @$params;
+    Carp::Clan::croak "too few parameters\n" unless @$params;
     my $param = shift @$params;
     
     if ($type eq 'd') {
@@ -64,7 +55,7 @@ sub _printf_quote_simple {
         $param = s/[\%_]/\\$1/g;
         $param = $dbh->quote($param); # be paranoiac, use DBI::db::quote
         $param =~ s/^'(.*)'$/$1/s
-            or die "unexpected quote char used: $param\n";
+            or Carp::Clan::croak "unexpected quote char used: $param\n";
     } elsif ($type eq 's') {
         if ($in_like) {
             $param =~ s/[%_]/\\$&/g;
@@ -72,15 +63,25 @@ sub _printf_quote_simple {
         $param = $dbh->quote($param);
         if ($in_like) {
             $param =~ s/^'(.*)'$/$1/s
-                or die "unexpected quote char: $param\n";
+                or Carp::Clan::croak "unexpected quote char: $param\n";
         }
     } elsif ($type eq 't') {
         # pass thru
     } else {
-        die "unexpected type: $type\n";
+        Carp::Clan::croak "unexpected type: $type\n";
     }
     
     $param;
+}
+
+package main;
+
+sub DBI::db::printf {
+    my ($dbh, $fmt, @params) = @_;
+    
+    my $sql = DBIx::Printf::_printf($dbh, $fmt, \@params);
+    Carp::Clan::croak "too many parameters\n" if @params;
+    $sql;
 }
 
 1;

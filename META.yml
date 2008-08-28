@@ -16,5 +16,6 @@ no_index:
     - inc
     - t
 requires: 
+  Carp::Clan: 0
   DBI: 0
-version: 0.06
+version: 0.07
