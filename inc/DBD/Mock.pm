@@ -14,14 +14,14 @@ sub import {
 #   License or the Artistic License, as specified in the Perl README file.
 # --------------------------------------------------------------------------- #
 
-use 5.006;
+use 5.008001;
 
 use strict;
 use warnings;
 
 require DBI;
 
-our $VERSION = '1.36';
+our $VERSION = '1.39';
 
 our $drh    = undef;    # will hold driver handle
 our $err    = 0;        # will hold any error codes
@@ -92,7 +92,8 @@ use constant NULL_RESULTSET => [[]];
 ########################################
 # DRIVER
 
-package DBD::Mock::dr;
+package
+    DBD::Mock::dr;
 
 use strict;
 use warnings;
@@ -106,35 +107,26 @@ sub connect {
         return;
     }
     $attributes ||= {};
+
     if ($dbname && $DBD::Mock::AttributeAliasing) {
         # this is the DB we are mocking
         $attributes->{mock_attribute_aliases} = DBD::Mock::_get_mock_attribute_aliases($dbname);
         $attributes->{mock_database_name} = $dbname;
     }
 
-    # Need to protect AutoCommit from $dbh caching - RobK.
-    my $autocommit = 1;
-    if( exists $attributes->{ 'AutoCommit' } ) {
-        $autocommit = delete $attributes->{ 'AutoCommit' };
-    }
+    # holds statement parsing coderefs/objects
+    $attributes->{mock_parser} = [];
+    # holds all statements applied to handle until manually cleared
+    $attributes->{mock_statement_history} = [];
+    # ability to fake a failed DB connection
+    $attributes->{mock_can_connect} = 1;
+    # ability to make other things fail :)
+    $attributes->{mock_can_prepare} = 1;
+    $attributes->{mock_can_execute} = 1;
+    $attributes->{mock_can_fetch}   = 1;
 
-    my $dbh = DBI::_new_dbh($drh, {
-        Name                   => $dbname,
-        # holds statement parsing coderefs/objects
-        mock_parser            => [],
-        # holds all statements applied to handle until manually cleared
-        mock_statement_history => [],
-        # ability to fake a failed DB connection
-        mock_can_connect       => 1,
-        # ability to make other things fail :)
-        mock_can_prepare       => 1,
-        mock_can_execute       => 1,
-        mock_can_fetch         => 1,
-        # rest of attributes
-        %{ $attributes },
-    }) || return;
-
-    $dbh->STORE( 'AutoCommit' => $autocommit );
+    my $dbh = DBI::_new_dbh($drh, {Name => $dbname})
+        || return;
 
     return $dbh;
 }
@@ -199,7 +191,8 @@ sub DESTROY { undef }
 ########################################
 # DATABASE
 
-package DBD::Mock::db;
+package
+    DBD::Mock::db;
 
 use strict;
 use warnings;
@@ -295,7 +288,7 @@ sub prepare {
         $sth->STORE(NUM_OF_FIELDS  => scalar @{$fields});
     }
     else {
-        $sth->trace_msg('No return data set in DBH', 1);
+        $sth->trace_msg("No return data set in DBH\n", 1);
     }
 
      # do not allow a statement handle to be created if there is no
@@ -396,21 +389,21 @@ sub selectcol_arrayref {
     # something went wrong, and so return undef.
     return undef unless defined $a_ref || ref($a_ref) ne 'ARRAY';
 
+    my @cols = 0;
+    if (ref $attrib->{Columns} eq 'ARRAY') {
+        @cols = map { $_ - 1 } @{$attrib->{Columns}};
+    }
+
     # if we do get something then we
     # grab all the columns out of it.
-    return [ map { $_->[0] } @{$a_ref} ]
+    return [ map { @$_[@cols] } @{$a_ref} ]
 }
 
-{
-    my %autocommit;
 sub FETCH {
-    my ( $dbh, $attrib ) = @_;
+    my ( $dbh, $attrib, $value ) = @_;
     $dbh->trace_msg( "Fetching DB attrib '$attrib'\n" );
-    if ($attrib eq 'AutoCommit') {
-        $dbh->trace_msg( "Fetching AutoCommit\n" );
-        return $autocommit{$dbh};
-    }
-     elsif ($attrib eq 'Active') {
+
+    if ($attrib eq 'Active') {
         return $dbh->{mock_can_connect};
     }
     elsif ($attrib eq 'mock_all_history') {
@@ -446,11 +439,14 @@ sub FETCH {
 sub STORE {
     my ( $dbh, $attrib, $value ) = @_;
     $dbh->trace_msg( "Storing DB attribute '$attrib' with '" . (defined($value) ? $value : 'undef') . "'\n" );
+
     if ($attrib eq 'AutoCommit') {
-        $autocommit{$dbh} = $value;
-        return $value;
+        # These are magic DBI values that say we can handle AutoCommit
+        # internally as well
+        $value = ($value) ? -901 : -900;
     }
-    elsif ( $attrib eq 'mock_clear_history' ) {
+
+    if ( $attrib eq 'mock_clear_history' ) {
         if ( $value ) {
             $dbh->{mock_statement_history} = [];
         }
@@ -535,10 +531,9 @@ sub STORE {
         return $dbh->SUPER::STORE($attrib, $value);
     }
   else {
-      $dbh->trace_msg("... storing non-driver attribute ($attrib) with value ($value) that DBI wont handle\n");
+      $dbh->trace_msg("... storing non-driver attribute ($attrib) with value ($value) that DBI won't handle\n");
       return $dbh->{$attrib} = $value;
   }
-}
 }
 
 sub DESTROY {
@@ -562,12 +557,21 @@ sub disconnect {
 ########################################
 # STATEMENT
 
-package DBD::Mock::st;
+package
+    DBD::Mock::st;
 
 use strict;
 use warnings;
 
 $DBD::Mock::st::imp_data_size = 0;
+
+sub bind_col {
+    my ($sth, $param_num, $ref, $attr) = @_;
+
+    my $tracker = $sth->FETCH( 'mock_my_history' );
+    $tracker->bind_col( $param_num, $ref );
+    return 1;
+}
 
 sub bind_param {
     my ($sth, $param_num, $val, $attr) = @_;
@@ -669,7 +673,17 @@ sub fetch {
     $dbh->{mock_can_fetch}++ if $dbh->{mock_can_fetch} < 0;
 
     my $tracker = $sth->FETCH( 'mock_my_history' );
-    return $tracker->next_record;
+
+    my $record = $tracker->next_record
+        or return;
+
+    if ( my @cols = $tracker->bind_cols() ) {
+        for my $i ( grep { ref $cols[$_] } 0..$#cols ) {
+            ${ $cols[$i] } = $record->[$i];
+        }
+    }
+
+    return $record;
 }
 
 sub fetchrow_array {
@@ -903,7 +917,8 @@ sub DESTROY { undef }
 # Database Pooling
 # (Apache::DBI emulation)
 
-package DBD::Mock::Pool;
+package
+    DBD::Mock::Pool;
 
 use strict;
 use warnings;
@@ -911,14 +926,18 @@ use warnings;
 my $connection;
 
 sub connect {
-    my $class = "DBD::Mock::Pool";
-    $class = shift unless ref($_[0]);
-    my ($driver_handle, $username, $password, $attributes) = @_;
-    $connection = bless $driver_handle->connect(), "DBD::Mock::Pool::db" unless $connection;
-    return $connection;
+    return $connection if $connection;
+
+    # according to the code before my tweaks, this could be a class
+    # name, but it was never used - DR, 2008-11-08
+    shift unless ref $_[0];
+
+    my $drh = shift;
+    return $connection = bless $drh->connect(@_), 'DBD::Mock::Pool::db';
 }
 
-package DBD::Mock::Pool::db;
+package
+    DBD::Mock::Pool::db;
 
 use strict;
 use warnings;
@@ -930,7 +949,8 @@ sub disconnect { 1 }
 ########################################
 # TRACKER
 
-package DBD::Mock::StatementTrack;
+package
+    DBD::Mock::StatementTrack;
 
 use strict;
 use warnings;
@@ -984,6 +1004,11 @@ sub num_params {
     return scalar @{$self->{bound_params}};
 }
 
+sub bind_col {
+    my ($self, $param_num, $ref) = @_;
+    $self->{bind_cols}->[$param_num - 1] = $ref;
+}
+
 sub bound_param {
     my ($self, $param_num, $value) = @_;
     $self->{bound_params}->[$param_num - 1] = $value;
@@ -993,6 +1018,11 @@ sub bound_param {
 sub bound_param_trailing {
     my ($self, @values) = @_;
     push @{$self->{bound_params}}, @values;
+}
+
+sub bind_cols {
+    my $self = shift;
+    return @{$self->{bind_cols} || []};
 }
 
 sub bind_params {
@@ -1103,7 +1133,8 @@ sub bound_params {
     return $self->{bound_params};
 }
 
-package DBD::Mock::StatementTrack::Iterator;
+package
+    DBD::Mock::StatementTrack::Iterator;
 
 use strict;
 use warnings;
@@ -1124,7 +1155,8 @@ sub next {
 
 sub reset { (shift)->{pointer} = 0 }
 
-package DBD::Mock::Session;
+package
+    DBD::Mock::Session;
 
 use strict;
 use warnings;
@@ -1234,4 +1266,4 @@ sub verify_bound_params {
 
 __END__
 
-#line 2064
+#line 2113
